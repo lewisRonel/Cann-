@@ -1,0 +1,993 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# setting the libraries 
+```{r}
+library(shiny)
+library(scales)
+library(shinythemes)
+library(dplyr)
+library(readxl)
+library(DT)
+library(shinydashboard)
+library(shinyWidgets)
+library(dygraphs)
+library(forecast)
+library(Hmisc)
+library(shinyjs)
+library(stringr)
+library(data.table)
+library(openxlsx)
+library(reshape2)
+library(tidyr)
+
+library(glmnet)
+library(car)
+library(MASS)
+library(tidymodels)
+
+library(caret)
+library(pROC)
+library(ggplot2)
+library(ggcorrplot)
+library(AER) # for cameron trivedi test 
+library(splines)
+library(ggeffects)
+library(pscl)
+
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+# 1- Getting and preparing the data and EDA
+
+```{r}
+df = data.table::fread("telematics_syn-032021.csv")
+
+# quick cleaning process 
+colSums(is.na(df))
+table(df$Insured.sex, df$Marital)
+table(df$Car.use, df$Region)
+summary(df)
+
+# replacing weird values 
+length(df[df$Car.age <0, ]) # 52 
+#replace by the median car age 
+median_age <- median(df$Car.age[df$Car.age >= 0], na.rm = TRUE)
+df$Car.age[df$Car.age < 0] <- median_age
+
+# distribution of claims in the portfolio 
+table(df$NB_Claim) # there is clearly a class imbalance, most of the contract have zero claims 
+
+```
+- no missing values; only two sex (male and female); Two factors in Regions (urban and rural)
+- 4 factors in car use : commercial, commute, farmer, private 
+- no abnormal
+- Policy holders age go from 16 to 103 with a median age of 51
+- there is a negative car age, that is some of the car age are < 0, how many? 52 lines, theses are mistakes ? so replace them by the median age 
+- NB claim has a max of 3, meaning that no contract has over 3 claims and the minimum is zero , since that is the class we are trying to predict
+
+| **Block**                     | **Columns**                                                                                                              | **Notes**                                                                                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Contract / exposure**       | Duration                                                                                                                 | In **DAYS**. Divide by 365 to get the exposure in years used as the log-offset.                                                                             |
+| **Traditional (10)**          | Insured.age, Insured.sex, Car.age, Marital, Car.use, Credit.score, Region, Annual.miles.drive, Years.noclaims, Territory | Classic underwriting rating factors. Territory has many levels (\~55), which is a known problem for GLMs.                                                   |
+| **Telematics – intensity**    | Annual.pct.driven, Total.miles.driven, Avgdays.week                                                                      | Usage volume.                                                                                                                                               |
+| **Telematics – day mix**      | Pct.drive.mon, ..., Pct.drive.sun, Pct.drive.wkday, Pct.drive.wkend                                                      | Compositional variables: these sum to approximately 1 by construction. Do not include all of them in a GLM simultaneously.                                  |
+| **Telematics – time mix**     | Pct.drive.2hrs, Pct.drive.3hrs, Pct.drive.4hrs, Pct.drive.rush am, Pct.drive.rush pm                                     | Trip length and rush-hour exposure.                                                                                                                         |
+| **Telematics – harsh events** | Accel.06/08/09/11/12/14miles, Brake.06/08/09/11/12/14miles                                                               | Counts per unit distance above increasing g-force thresholds. Monotone nested structure: the 06-threshold count ≥ the 14-threshold count. Highly collinear. |
+| **Telematics – cornering**    | Left.turn.intensity08–12, Right.turn.intensity08–12                                                                      | Same nested-threshold structure.                                                                                                                            |
+| **Response**                  | NB\_Claim, AMT\_Claim                                                                                                    | Claim count and aggregate claim amount. **NB\_Claim** is the target variable.                                                                               |
+
+
+```{r}
+# looking art Territory variable 
+table(df$Territory) # too many factors, drop this 
+df$Territory <- NULL
+
+# exposure calculation 
+df = as.data.frame(df)
+df["Exposure"] = df["Duration"] / 365.0 
+#a look at the distribution of the claim 
+describe(df$NB_Claim)
+describe(df$AMT_Claim)
+
+continuous_var = c("Insured.age", "Car.age", "Credit.score", "Years.noclaims")
+Telematrics_vars = c("Total.miles.driven", "Pct.drive.rush pm", "Pct.drive.rush am",
+                     "Pct.drive.wkend","Avgdays.week", "Brake.14miles", "Right.turn.intensity12",
+                     "Left.turn.intensity12", "Accel.14miles")
+categorical_var = c("Insured.sex", "Marital", "Region", "Car.use")
+
+```
+
+## distribution of claims 
+
+- Cameron - Trivedi Score test : A formal test of H₀: Var = μ against 
+H₁: Var = μ + αμ² (the NB2 variance function). Construct the auxiliary variable and test whether its mean is zero:
+```{r}
+
+# checking if it follows a poisson or negative binomial (overdispersion)
+var(df$NB_Claim)/mean(df$NB_Claim) # greter than 1 so overdispersion ? 
+# a statistcall check Cameron–Trivedi score test
+
+m_pois <- glm(
+  NB_Claim ~ Insured.age + Credit.score,
+  offset = log(Exposure),
+  family = poisson(),
+  data = df
+)
+
+dispersiontest(m_pois) # p value > 0.01 so we reject the posson distribution 
+
+```
+
+## actuarial analysis of claims 
+### for continuous variables 
+```{r}
+freq_band_plot <- function(dt,
+                           var,
+                           exposure = "Exposure",
+                           target = "NB_Claim") {
+
+  dt <- as.data.table(dt)
+
+  # Aggregate by variable
+  res <- dt[
+    ,
+    .(
+      Exposure = sum(get(exposure), na.rm = TRUE),
+      Claims   = sum(get(target), na.rm = TRUE)
+    ),
+    by = var
+  ]
+
+  # Frequency
+  res[, Frequency := Claims / Exposure]
+
+  # Scaling factor for dual axis
+  scale_factor <- max(res$Exposure, na.rm = TRUE) /
+                  max(res$Frequency, na.rm = TRUE)
+
+  p <- ggplot(
+    res,
+    aes_string(x = var)
+  ) +
+    geom_col(
+      aes(y = Exposure),
+      fill = "lightblue",
+      alpha = 0.7
+    ) +
+    geom_line(
+      aes(y = Frequency * scale_factor, group = 1),
+      color = "red",
+      linewidth = 1.2
+    ) +
+    geom_point(
+      aes(y = Frequency * scale_factor),
+      color = "red",
+      size = 2
+    ) +
+    scale_y_continuous(
+      name = "Exposure",
+      sec.axis = sec_axis(
+        ~ . / scale_factor,
+        name = "Claim Frequency"
+      )
+    ) +
+    labs(
+      title = paste("Claim Frequency by", var),
+      x = var
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+  print(p)
+
+  return(res)
+}
+
+```
+## for categorical variables 
+```{r}
+
+freq_cat_plot <- function(dt,
+                          var,
+                          exposure = "Exposure",
+                          target = "NB_Claim") {
+
+  # Aggregate by category
+  res <- dt[
+    ,
+    .(
+      Exposure = sum(get(exposure), na.rm = TRUE),
+      Claims = sum(get(target), na.rm = TRUE)
+    ),
+    by = var
+  ]
+
+  # Rename category column
+  setnames(res, var, "Category")
+
+  # Observed frequency
+  res[, Frequency := Claims / Exposure]
+
+  # Sort by frequency for easier interpretation
+  setorder(res, Frequency)
+
+  # Scale factor for dual axis
+  scale_factor <- max(res$Exposure, na.rm = TRUE) /
+                  max(res$Frequency, na.rm = TRUE)
+
+  p <- ggplot(res,
+              aes(x = reorder(Category, Frequency))) +
+    geom_col(
+      aes(y = Exposure),
+      fill = "lightblue",
+      alpha = 0.7
+    ) +
+    geom_line(
+      aes(y = Frequency * scale_factor, group = 1),
+      color = "red",
+      linewidth = 1
+    ) +
+    geom_point(
+      aes(y = Frequency * scale_factor),
+      color = "red",
+      size = 2
+    ) +
+    scale_y_continuous(
+      name = "Exposure",
+      sec.axis = sec_axis(
+        ~ . / scale_factor,
+        name = "Observed Frequency"
+      )
+    ) +
+    labs(
+      title = paste("Observed Frequency by", var),
+      x = var
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+  print(p)
+
+  return(res)
+}
+```
+
+## looking at the eposure and frequencies by variables 
+
+```{r}
+for (cat in continuous_var) freq_band_plot(df, cat)
+```
+## modifications to continuous variables 
+we will create age bands for the insurer age using frequency patterns 
+Band	Age Range	Rationale
+- **Young Drivers**	18–25	Very high frequency (peaks at ~20–23)
+- **Early Career**	26–35	Elevated but declining frequency
+- **Established**	36–50	Moderate, stable frequency
+- **Mature**	51–65	Lower, stable frequency
+- **Senior**	66+	Very low frequency (sparse data)
+
+### Years no claims 
+we observe a non linear relationship, so we need to create bands , then check if the bands 
+created represent the actual correct relationship 
+
+```{r}
+dt[, NCDBand := cut(Years.noclaims, 
+                    breaks = c(-Inf, 2,4, 9 , 19, 34, Inf), 
+                    labels = c("0-2",  "3-4", "5-9", "10-19", "20-34", "35+"))]
+
+  res2 <- dt[
+    ,
+    .(
+      exposure = sum(Exposure),
+      Claims = sum(NB_Claim)
+    ),
+    by = NCDBand
+  ][order(NCDBand)]
+# check using negative binomial glm 
+  m_line = glm.nb(NB_Claim ~ Years.noclaims + offset (log(Exposure)), dt)
+  m_band = glm.nb(NB_Claim ~ NCDBand  + offset (log(Exposure)), dt)
+  m_spline = glm.nb(NB_Claim ~ splines::ns(Years.noclaims, 4) + offset (log(Exposure)), dt)
+  
+AIC(m_line, m_band, m_spline)
+
+```
+clearly approximating the effect of Years.no.claims by a spline is far better, lets tune the hyperparameter that is the degree of fredom ( **dont use**)
+```{r}
+sapply(2:7, function(k) AIC(glm(NB_Claim ~ splines::ns(Years.noclaims, k) + offset (log(Exposure)), dt, family = poisson))
+  ) # keep 4 as df 
+
+# testing the accuyracy on the zero exposure region of years.noclaims *
+tail(dt[
+    ,
+    .(
+      exposure = sum(Exposure),
+      Claims = sum(NB_Claim)
+    ),
+    by = Years.noclaims 
+  ][order(Years.noclaims)], 25)
+# candidates cap + no caps 
+caps = c(25, 30, 35, 40, 45, Inf )
+res_cap = data.table::rbindlist(lapply(caps, function(cp){
+  # d = data.table :: copy(dt)
+ NCD = pmin(dt$Years.noclaims, cp)
+  m = glm(NB_Claim ~ splines::ns(NCD, 4) + offset (log(Exposure)), dt, family = poisson)
+  data.table(cap =cp, AIC = AIC(m))
+}
+  
+  ))
+
+res_cap[order(AIC)]
+```
+## credit score 
+create a credit score band then compare the AIC to the one with credit score 
+```{r}
+# Credit score bands
+dt[, Credit_Band := fcase(
+  Credit.score < 700,                      "<700",
+  Credit.score >= 700 & Credit.score < 800, "700-800",
+  Credit.score >= 800,                     "800+"
+)]
+# check 
+  m_band  = glm.nb(NB_Claim ~ as.factor(Credit_Band) + offset (log(Exposure)), dt)
+  m_line = glm.nb(NB_Claim ~ Credit.score  + offset (log(Exposure)), dt)
+  m_spline = glm.nb(NB_Claim ~ splines::ns(Credit.score, 4) + offset (log(Exposure)), dt)
+  
+AIC(m_line, m_band, m_spline)
+
+```
+good the AIC is similar so i am takingt the spline  
+
+
+```{r}
+for (var in categorical_var) freq_cat_plot(dt, var)
+```
+# modifications of the categorical columns 
+- Car.use : Most of the exposure is observed in the Private and Commute segments, while the Farmer and Commercial segments account for only a small proportion of the portfolio. Given the low exposure and the potential volatility of observed claim frequencies in these categories, Farmer and Commercial will be grouped with the larger categories to ensure more reliable risk estimation.
+
+```{r}
+# car use : 
+ dt[, Car.use :=
+     fifelse(Car.use == "Farmer", "Private",
+     fifelse(Car.use == "Commercial", "Commute",Car.use ))]
+```
+
+##  a look at telematrics data 
+we are only looking at the ones i kept as interesting ones 
+```{r}
+
+
+corr <- cor(df[, Telematrics_vars], use = "complete.obs")
+
+ggcorrplot(
+  corr,
+  type = "lower",
+  lab = TRUE,
+  lab_size = 3,
+  colors = c("#2166AC", "white", "#B2182B")
+) +
+  ggtitle("Correlation Matrix - Telematics Variables") +
+  theme_minimal() + theme (
+    axis.text.x = element_text(
+      angle = 90, 
+      vjust = 0.5, 
+      hjust = 1 
+    )
+  )
+```
+clearly Accel.14miles and Brake.14miles arfe very highly correlated , 
+this is normal as a higher acceleration leads to higher brake. Lets look at how each of those 
+are correlated to the target variable
+```{r}
+m1 <- glm(
+  NB_Claim ~ Accel.14miles,
+  offset = log(Exposure),
+  family = poisson(),
+  data = df
+)
+
+m2 <- glm(
+  NB_Claim ~ Brake.14miles,
+  offset = log(Exposure),
+  family = poisson(),
+  data = df
+)
+
+AIC(m1, m2)
+
+m0 <- glm(
+  NB_Claim ~ 1,
+  offset = log(Exposure),
+  family = poisson,
+  data = df
+)
+
+anova(m0, m1, test = "Chisq")
+anova(m0, m2, test = "Chisq") # PTOVE THAT BOTH MODELS ARE THE SAME 
+
+
+```
+both models have the exact same AIC so, they clearly both restitute the same informationn, we will 
+drop the Accel.14miles one 
+
+# 2. VARIABLES SELECTION 
+
+## 2.1 splitting 
+Split 60 / 20 / 20 into training, validation and testing, stratified on whether a claim occurred so that the rare positive class is represented in all three. Because this dataset is cross-sectional, a simple random split is valid 
+```{r}
+
+set.seed(123)
+df  = as.data.frame(dt)
+# mutate the categorical to factors 
+df <- df %>%
+  rename(
+    Pct.drive.rush.pm = `Pct.drive.rush pm`,
+    Pct.drive.rush.am = `Pct.drive.rush am`
+  ) %>%
+  mutate( # here i am creatiung new variable (factors that i will add into a new model)
+
+    Car.age.band = case_when(
+      Car.age <= 2                  ~ "0-2",
+      Car.age <= 5                  ~ "3-5",
+      Car.age <= 10                 ~ "5-10",
+      TRUE                          ~ "10+"
+    ),
+
+    Credit.score.band = case_when(
+      Credit.score < 600            ~ "<600",
+      Credit.score < 700            ~ "600-700",
+      Credit.score < 850            ~ "700-850",
+      TRUE                          ~ "850+"
+    ),
+    Insured.age.band = cut(
+      Insured.age,
+      breaks = c(-Inf, 20, 30, 40, 60, Inf),
+      labels = c("≤20", "21-30", "31-40", "41-60", "60+"),
+      right = TRUE
+    )
+    ,
+
+    Years.noclaims.band = case_when(
+      Years.noclaims <= 5           ~ "0-5",
+      Years.noclaims <= 10          ~ "5-10",
+      Years.noclaims <= 20          ~ "10-20",
+      Years.noclaims <= 30          ~ "20-30",
+      TRUE                          ~ "30+"
+    )
+  ) 
+
+df = df %>%  mutate(
+    across(
+      c(Insured.sex, Marital, Region, 
+        Car.use, Car.use.grp, Years.noclaims.band, Credit.score.band, Insured.age.band,
+        Car.age.band),
+      factor
+    )
+  )
+df$HasClaim <- ifelse(df$NB_Claim > 0, 1, 0)
+# 60% train
+train_idx <- createDataPartition(df$HasClaim,
+                                 p = 0.60,
+                                 list = FALSE)
+
+train <- df[train_idx, ]
+temp  <- df[-train_idx, ]
+# Split remaining 40% into 20/20
+valid_idx <- createDataPartition(temp$HasClaim,
+                                 p = 0.50,
+                                 list = FALSE)
+
+valid <- temp[valid_idx, ]
+test  <- temp[-valid_idx, ]
+
+# Variables to use
+Telematrics_vars = c("Total.miles.driven", "Pct.drive.rush.pm", "Pct.drive.rush.am",
+                     "Pct.drive.wkend","Avgdays.week", "Brake.14miles", "Right.turn.intensity12",
+                     "Left.turn.intensity12", "Accel.14miles")
+features <- setdiff(
+  c(
+    continuous_var,
+    categorical_var,
+    Telematrics_vars,
+    "Car.use.grp",
+    "Exposure", "Years.noclaims.band", "Credit.score.band", "Insured.age.band","Car.age.band"
+  ),
+  c("Accel.14miles", "Car.use")
+)
+
+# X datasets
+X_train <- train %>%
+  dplyr::select(all_of(features))
+
+X_valid <- valid %>%
+  dplyr::select(all_of(features))
+
+X_test <- test %>%
+  dplyr::select(all_of(features))
+
+# y datasets
+y_train <- train$NB_Claim
+y_valid <- valid$NB_Claim
+y_test  <- test$NB_Claim
+# define formula for the glm 
+formula_glm <- NB_Claim ~
+  ns(Car.age, df = 4) +
+  ns(Credit.score, df = 4) +
+  ns(Years.noclaims, df = 4) +
+  Insured.age +
+  Insured.sex +
+  Marital +
+  Region +
+  Car.use.grp +
+  Total.miles.driven +
+  Pct.drive.rush.pm +
+  Pct.drive.rush.am +
+  Pct.drive.wkend +
+  Avgdays.week +
+  Brake.14miles +
+  Right.turn.intensity12 +
+  Left.turn.intensity12 +
+  offset(log(Exposure))
+## First varibale selections using VIF to remove highly collinear variables 
+train_glm <- cbind(
+  NB_Claim = y_train,
+  X_train
+) # temp traing full dataset 
+test_glm <- cbind(
+  NB_Claim = y_test,
+  X_test
+) # test daastet 
+
+valid_glm <- cbind(
+  NB_Claim = y_valid,
+  X_valid
+)
+m_full <- glm.nb(
+  formula = formula_glm,
+  data = train_glm
+)
+car::vif(m_full)
+################################# SECONDE SELECTION stepwise regression + ANOVA 
+
+# Modèle complet (M_1)
+M_1 <- glm.nb(formula = formula_glm,
+  data = train_glm)
+# Modèle réduit sans variable (M_0)
+M_0 <- glm.nb(NB_Claim ~ 1, data = train_glm)
+
+# Sélection stepwise basée sur AIC
+model_aic1 <- stats :: step(M_0, 
+                                scope = list(lower = M_0, upper = M_1),
+                                direction = "both",
+                                trace = 0)
+summary(model_aic1)
+# check if some of the variables should be dropped 
+drop1(model_aic1, test = "Chisq")
+
+# i will drop 
+- Avgdays.week ; 
+model_aic1 <- update(
+  model_aic1,
+  . ~ . - Avgdays.week 
+)
+drop1(model_aic1, test = "Chisq")
+pseudo_r_1 = pR2(model_aic1)["McFadden"] 
+
+# look at the ways the splines look 
+ggpredict(model_aic1, terms = "Years.noclaims") |>
+plot()
+ggpredict(model_aic1, terms = "Car.age") |>
+plot()
+ggpredict(model_aic1, terms = "Credit.score") |>
+plot()
+# ggpredict(model_aic1, terms = "Insured.age") |>
+# plot()
+
+# having observed these graphs, we are going to create new bands for some of the variables 
+#and integrate them into the dataset then build an new model and compare the AIC 
+formula_glm2 <- NB_Claim ~
+  Car.age.band +
+  Credit.score.band +
+  Years.noclaims.band +
+  Insured.age.band +
+  Insured.sex +
+  Marital +
+  Region +
+  Car.use.grp +
+  Total.miles.driven +
+  Pct.drive.rush.pm +
+  Pct.drive.rush.am +
+  Pct.drive.wkend +
+  Avgdays.week +
+  Brake.14miles +
+  Right.turn.intensity12 +
+  Left.turn.intensity12 +
+  offset(log(Exposure))
+
+m2_full <- glm.nb(
+  formula = formula_glm2,
+  data = train_glm
+)
+car::vif(m2_full)
+# Modèle complet (M_1)
+M_1 <- glm.nb(formula = formula_glm2,
+  data = train_glm)
+# Modèle réduit sans variable (M_0)
+M_0 <- glm.nb(NB_Claim ~ 1, data = train_glm)
+
+# Sélection stepwise basée sur AIC
+model_aic2 <- stats :: step(M_0, 
+                                scope = list(lower = M_0, upper = M_1),
+                                direction = "both",
+                                trace = 1)
+
+summary(model_aic2)
+drop1(model_aic2, test = "Chisq")
+# we remove
+# - Pct.drive.rush.pm
+# - Right.turn.intensity12
+model_aic2 <- update(
+  model_aic2,
+  . ~ . - c("Pct.drive.rush.pm", "Right.turn.intensity12") 
+)
+pseudo_r_2 = pR2(model_aic2)["McFadden"] # mcfarden pseudo r squard
+```
+
+- using vif, not too much multicolinearity issue in the dataset, all variables 
+have vif < 3 
+- second selection AIC based selction, then ANOVA 
+## using validation test to compare both models 
+```{r}
+# generate validation predictions 
+pred_aic1 <- predict(
+  model_aic1,
+  newdata = valid_glm,
+  type = "response"
+)
+
+pred_aic2 <- predict(
+  model_aic2,
+  newdata = valid_glm,
+  type = "response"
+)
+# Validation comparison function
+compare_freq_model <- function(predictions,
+                               observed,
+                               exposure,
+                               model_name,
+                               theta = NULL) {
+
+  rmse <- sqrt(mean((observed - predictions)^2))
+  mae <- mean(abs(observed - predictions))
+  observed_freq <- sum(observed) / sum(exposure)
+  predicted_freq <- sum(predictions) / sum(exposure)
+  calibration_error <- abs(
+    observed_freq - predicted_freq
+  )
+  data.frame(
+    Model = model_name,RMSE = rmse,MAE = mae, ObsFreq = observed_freq,
+    PredFreq = predicted_freq,
+    CalibrationError = calibration_error
+  )
+}
+# compare models 
+validation_results <- bind_rows(
+
+  compare_freq_model(
+    pred_aic1,
+    valid_glm$NB_Claim,
+    valid_glm$Exposure,
+    "AIC Model 1"
+  ),
+
+  compare_freq_model(
+    pred_aic2,
+    valid_glm$NB_Claim,
+    valid_glm$Exposure,
+    "AIC Model 2"
+  )
+
+)
+
+validation_results
+
+# Compare Negative Binomial log-likelihood
+ll_aic1 <- sum(
+  dnbinom(
+    valid_glm$NB_Claim,
+    mu = pred_aic1,
+    size = model_aic1$theta,
+    log = TRUE
+  )
+)
+
+ll_aic2 <- sum(
+  dnbinom(
+    valid_glm$NB_Claim,
+    mu = pred_aic2,
+    size = model_aic2$theta,
+    log = TRUE
+  )
+)
+
+data.frame(
+  Model = c("AIC1", "AIC2"),
+  ValidationLogLik = c(ll_aic1, ll_aic2)
+)
+# Visual comparison
+errors_long <- validation_results %>%
+  tidyr::pivot_longer(
+    cols = -Model,
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+ggplot(
+  errors_long,
+  aes(Model, Value, fill = Metric)
+) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Validation Set Comparison",
+    x = "",
+    y = ""
+  )
+```
+- model 2 seemms to be slighty better , iw will check if the difference is stats signin
+```{r}
+ll1 <- dnbinom(
+  valid_glm$NB_Claim,
+  mu   = pred_aic1,
+  size = model_aic1$theta,
+  log  = TRUE
+)
+
+ll2 <- dnbinom(
+  valid_glm$NB_Claim,
+  mu   = pred_aic2,
+  size = model_aic2$theta,
+  log  = TRUE
+)
+
+# Paired t-test
+t.test(ll1, ll2, paired = TRUE)
+```
+
+- the difference is statistically significant , so we keep model 2 
+
+- now lasso ridge 
+```{r}
+library(glmnet)
+# Design matrices for glmnet
+x_train_mat <- model.matrix(~ ., data = X_train)[, -1]
+x_valid_mat <- model.matrix(~ ., data = X_valid)[, -1]
+x_test_mat  <- model.matrix(~ ., data = X_test)[, -1]
+
+cv_lasso <- cv.glmnet(
+  x = x_train_mat,
+  y = y_train,
+  family = "poisson",
+  alpha = 1,
+  nfolds = 5,
+  standardize = TRUE,
+  offset = log(X_train$Exposure)
+)
+# Plot CV curve
+plot(cv_lasso)
+coef_lasso <- coef(cv_lasso, s = "lambda.min")
+
+selected_vars <- rownames(coef_lasso)[
+  coef_lasso[, 1] != 0
+]
+# refitting using the selecting variables on a negative binomial 
+selected_vars <- setdiff(selected_vars, c("(Intercept)"))
+
+formula_nb <- as.formula(
+  paste(
+    "NB_Claim ~",
+    paste(selected_vars, collapse = " + "), 
+    "+ offset(log(Exposure))"
+  )
+)
+
+# Refit Negative Binomial model
+m_nb <- glm.nb(
+  formula = formula_nb,
+  data = train_glm
+)
+
+summary(m_nb)
+AIC(m_nb)
+
+```
+
+# evaluation of models 
+```{r}
+
+# - m_nb : the one using lasso variables 
+# - model_aic2 : the one using the bands
+# - model_aic1 the one using the splines 
+
+# Fonction pour calculer AUC et Gini
+
+calculate_errors <- function(predictions, observed,
+                             threshold = 0.5,
+                             model_name) {
+  
+  pred_class <- factor(
+    ifelse(predictions >= threshold, 1, 0),
+    levels = c(0, 1)
+  )
+  
+  actual_class <- factor(
+    as.numeric(observed),
+    levels = c(0, 1)
+  )
+  
+  cm <- confusionMatrix(
+    pred_class,
+    actual_class,
+    positive = "1"
+  )
+  
+  roc_obj <- roc(actual_class, predictions, quiet = TRUE)
+  auc_value <- as.numeric(auc(roc_obj))
+  
+  data.frame(
+    Model       = model_name,
+    Accuracy    = cm$overall["Accuracy"],
+    ErrorRate   = 1 - cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Precision   = cm$byClass["Pos Pred Value"],
+    F1_Score    = cm$byClass["F1"],
+    AUC         = auc_value,
+    Gini        = 2 * auc_value - 1,
+    row.names = NULL
+  )
+}
+
+errors <- dplyr::bind_rows(
+  calculate_errors(pred_logit_selected, y_test, model_name = "Logit - Selected"),
+  calculate_errors(pred_logit_lasso, y_test, model_name = "Logit - LASSO"),
+  calculate_errors(pred_logit_combined, y_test, model_name = "logit - combined")
+)
+
+print(errors)
+
+# i will test if the AUC difference between the combined and the selected model 
+# is acxtuallyh statiscally signiicant 
+roc_selected <- roc(y_test, pred_logit_selected)
+roc_combined <- roc(y_test, pred_logit_combined)
+
+roc.test(roc_selected, roc_combined, method = "delong")
+# p valuje being less than 1 % we confirm that the difference is stat signi
+# so the he combined model significantly outperforms the selected model in AUC.
+
+##################### comparaions 
+
+# visualisation des erreurs 
+
+# Transformer pour ggplot
+errors_long <- errors %>%
+  pivot_longer(cols = -Model, 
+               names_to = "Metric", 
+               values_to = "Value")
+
+# Graphique des métriques principales
+ggplot(errors_long %>% 
+         filter(Metric %in% c("Accuracy", "Error_Rate", "Sensitivity", "Specificity")),
+       aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Comparaison des métriques d'erreur",
+       y = "Valeur", x = "Modèle") +
+  theme_minimal()
+
+# Graphique AUC et Gini
+ggplot(errors_long %>% 
+         filter(Metric %in% c("AUC", "Gini")),
+       aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "AUC et Gini par modèle",
+       y = "Valeur", x = "Modèle") +
+  theme_minimal()
+
+
+#courbes ROC
+
+# Créer un graphique avec les 4 courbes ROC
+par(mfrow = c(2, 2))
+
+# Logit - Selected
+roc1 <- roc(y_test, pred_logit_selected)
+plot(roc1, main = "Logit - Selected Features", col = "blue")
+
+# Logit - LASSO
+roc2 <- roc(y_test, pred_logit_lasso)
+plot(roc2, main = "Logit - LASSO Features", col = "red")
+
+# Probit - combined 
+roc3 <- roc(y_test, pred_logit_combined)
+plot(roc3, main = "Probit - Selected Features", col = "green")
+
+
+
+par(mfrow = c(1, 1))
+
+
+# Out of the logit binary classicification models , the one using the combined features i
+# is the winner, but lets se if by taking out eh non statist signi featurs,we can make it better 
+
+summary(model_logit_combined)
+new_test_features <- setdiff(
+  combined_features,
+  c("ROI...Return.On.Investment", "Current.Ratio")
+)
+
+new_test_features
+formula_combined2 <- as.formula(paste("Invest_grade ~", 
+                                     paste(new_test_features, collapse = " + ")))
+model_logit_combined2 <- glm(formula_combined2, 
+                         data = data_train_full, 
+                         family = binomial(link = "logit"))
+pred_logit_combined2 <- predict(model_logit_combined2, 
+                            newdata = data_test_full, 
+                            type = "response")
+errors <- dplyr::bind_rows(
+  calculate_errors(pred_logit_combined, y_test, model_name = "logit - combined"),
+  calculate_errors(pred_logit_combined2, y_test, model_name = "logit - combined2")
+)
+print(errors)
+```
+
+# 3. Modele CANN 
+##  Architecture
+The CANN blends a classical regression with a network by adding their linear predictors before the link:
+- The log-linear part receives ONLY traditional risk factors. It is deliberately constrained — it provides the stable, interpretable backbone.
+
+- The MLP receives traditional AND telematics inputs, so it can learn interactions BETWEEN them, not just telematics effects in isolation. This is exactly what the paper argues a manually engineered feature set cannot do.
+
+
+```{r}
+#separons les variables traditioneles et les telematrics 
+trad_vars <- c(
+  "Insured.age.band",
+  "Car.age.band","Credit.score.band","Years.noclaims.band",
+"Marital", "Region","Car.use.grp"
+)
+
+tele_vars <- c(
+  "Total.miles.driven",
+  "Pct.drive.rush.pm",
+  "Pct.drive.rush.am",
+  "Pct.drive.wkend",
+  "Avgdays.week",
+  "Brake.14miles",
+  "Right.turn.intensity12",
+  "Left.turn.intensity12"
+)
+
+# on récupère les coeffcients du modèle glm 
+glm_base <- glm.nb(
+  NB_Claim ~
+    Insured.age.band +
+    Car.age.band +
+    Credit.score.band +
+    Years.noclaims.band +
+    Marital +
+    Region +
+    Car.use.grp +
+    offset(log(Exposure)),
+  data = train_glm
+)
+```
+
