@@ -5,6 +5,7 @@ output: html_notebook
 
 # setting the libraries 
 ```{r}
+#rm(list = ls(all.names = TRUE))
 library(shiny)
 library(scales)
 library(shinythemes)
@@ -594,8 +595,8 @@ formula_glm2 <- NB_Claim ~
   Car.age.band +
   Credit.score.band +
   Years.noclaims.band +
-  Insured.age.band +
-  Insured.sex +
+  #Insured.age.band + # not statitically significant to be removed 
+  Insured.sex + 
   Marital +
   Region +
   Car.use.grp +
@@ -627,13 +628,13 @@ model_aic2 <- stats :: step(M_0,
                                 trace = 1)
 
 summary(model_aic2)
-drop1(model_aic2, test = "Chisq")
+drop1(model_aic2, test = "Chisq") 
 # we remove
 # - Pct.drive.rush.pm
 # - Right.turn.intensity12
 model_aic2 <- update(
   model_aic2,
-  . ~ . - c("Pct.drive.rush.pm", "Right.turn.intensity12") 
+  . ~ . - c("Pct.drive.rush.pm", "Right.turn.intensity12", ) 
 )
 pseudo_r_2 = pR2(model_aic2)["McFadden"] # mcfarden pseudo r squard
 ```
@@ -959,13 +960,13 @@ The CANN blends a classical regression with a network by adding their linear pre
 
 ```{r}
 #separons les variables traditioneles et les telematrics 
-trad_vars <- c(
+others_vars <- c(
   "Insured.age.band",
   "Car.age.band","Credit.score.band","Years.noclaims.band",
-"Marital", "Region","Car.use.grp"
+"Marital", "Region","Car.use.grp", "Insured.sex"
 )
 
-tele_vars <- c(
+telem_vars <- c(
   "Total.miles.driven",
   "Pct.drive.rush.pm",
   "Pct.drive.rush.am",
@@ -977,17 +978,48 @@ tele_vars <- c(
 )
 
 # on récupère les coeffcients du modèle glm 
-glm_base <- glm.nb(
-  NB_Claim ~
-    Insured.age.band +
-    Car.age.band +
-    Credit.score.band +
-    Years.noclaims.band +
-    Marital +
-    Region +
-    Car.use.grp +
-    offset(log(Exposure)),
-  data = train_glm
+glm_base <- model_aic2
+
+X_trad <- model.matrix(
+  delete.response(terms(glm_base)),
+  train_glm
 )
+beta0 = coef(base_glm) # initialise the coefficientds of  the base glm 
+###################################""constrruire le réseau keras 
+library(keras)
+n_trad <- ncol(X_trad)
+n_telematrics <- length(tele_vars)
+
+input_trad <- layer_input(
+  shape = n_trad
+)
+input_tele <- layer_input(
+  shape = n_tele
+)
+input_offset <- layer_input(
+  shape = 1
+)
+#Branche télématique
+#nitialiser la dernière couche à zéro
+nn_part <-
+  layer_concatenate(
+    list(input_trad, input_tele)
+  ) %>%
+  layer_dense(
+    64,
+    activation = "tanh"
+  ) %>%
+  layer_dropout(0.2) %>%
+  layer_dense(
+    32,
+    activation = "tanh"
+  ) %>%
+  layer_dense(
+    units = 1,
+    activation = "linear",
+    kernel_initializer = "zeros",
+    bias_initializer = "zeros"
+  )
+
 ```
 
