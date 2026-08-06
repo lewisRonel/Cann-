@@ -22,14 +22,15 @@ suppressPackageStartupMessages({
   library(pscl)            # pR2
   library(car)             # vif
   library(glmnet)          # kept for reference; not used in the final variable-selection path
-  library(torch)           # CANN
+  # library(torch)  
+  library(keras3)# CANN
 })
 ```
 
 # 1. Data load and cleaning
 
 ```{r load}
-dt <- fread("telematics_syn-032021.csv")
+dt <- fread("telematics_syn-032021.csv") # faster than read_csv and handles separators directly 
 cat("dim:", dim(dt), "\n")
 ```
 
@@ -49,13 +50,11 @@ table(dt$Car.use, dt$Region)
 ```{r drop-territory}
 cat("Territory levels:", uniqueN(dt$Territory), "\n")
 dt[, Territory := NULL]
+summary(dt)
 ```
 
 `Car.age` has negative values (model year ahead of the policy year — a data error,
 not a real "negative age"). **Correction to the original pass at this notebook:**
-`length(df[df$Car.age < 0, ])` on a `data.frame` counts *columns*, not rows, so it
-silently reported "52" when the real number is much larger. Using `data.table`'s `.N`
-gives the correct row count:
 
 ```{r fix-car-age}
 n_bad_age <- dt[Car.age < 0, .N]
@@ -65,7 +64,7 @@ dt[Car.age < 0, Car.age := med_car_age]
 ```
 
 ```{r exposure-response}
-dt[, Exposure := Duration / 365]  # Duration is in DAYS
+dt[, Exposure := Duration / 365]  # Duration is in DAYS, so cobveret to years 
 summary(dt$Exposure)
 
 table(dt$NB_Claim)
@@ -73,9 +72,7 @@ cat(sprintf("policies with >=1 claim: %d (%.2f%%)\n", dt[NB_Claim > 0, .N], 100 
 cat("portfolio frequency:", dt[, sum(NB_Claim) / sum(Exposure)], "\n")
 ```
 
-No contract has more than 3 claims; ~4.3% of policies have at least one claim (the
-checkpoint in the project plan quotes ~2.7% from other studies using this file — the
-gap is worth flagging in any write-up, but doesn't change the modelling approach).
+No contract has more than 3 claims; ~4.3% of policies have at least one claim.
 
 Two columns have spaces in their names, which is friction for everything downstream —
 rename once, up front:
@@ -91,9 +88,7 @@ setnames(dt, c("Pct.drive.rush am", "Pct.drive.rush pm"),
 
 The dataset is cross-sectional (one row per policy), so a simple random split is
 valid — there's no vehicle/insured grouping constraint to respect. Stratifying on
-`HasClaim` keeps the ~4.3% positive rate stable across all three sets. This replaces
-the `caret::createDataPartition` dependency with ~15 lines of base R that do exactly
-the same thing.
+`HasClaim` keeps the ~4.3% positive rate stable across all three sets. 
 
 ```{r split}
 dt[, HasClaim := as.integer(NB_Claim > 0)]
@@ -120,18 +115,96 @@ cat("claim rate by split:", mean(train$HasClaim), mean(valid$HasClaim), mean(tes
 
 ## 2.2 The linear-vs-spline-vs-bands decision, made the same way for every variable
 
-This is the direct answer to "I keep going back and forth on bands vs. splines":
-instead of eyeballing a one-way plot and picking per variable (which is what produced
-the inconsistent `NCDBand` / `Credit_Band` / `Credit.score.band` naming and the
-undefined-`dt` bug in the earlier pass), fit **all three candidate forms** for every
-continuous variable on `train`, score them on **held-out validation Poisson deviance**
-— not in-sample AIC, which can't tell overfitting from real signal — and keep the
+For the continuous variables like credit score or age , we have to decide , if we will consider the relationship to be linear, non linear or by bands. But before , i want to look at the exposure and frequency for those variables 
+```{r}
+continuous_vars <- c("Insured.age", "Car.age", "Credit.score", "Years.noclaims", "Annual.miles.drive")
+#plotting dunction
+library(data.table)
+library(ggplot2)
+
+freq_cont_plot <- function(dt,var,exposure = "Exposure",target = "NB_Claim", n_bands = 10) {
+
+  tmp <- copy(dt)
+  breaks = unique (quantile(dt[[var]], probs = seq(0,1, length.out= n_bands+1), na.rm=TRUE))
+
+  tmp[, Band := cut(
+    get(var),breaks = breaks, inclue.lowest = TRUE) ]
+
+  res <- tmp[
+    ,
+    .(
+      Exposure = sum(get(exposure), na.rm = TRUE),
+      Claims = sum(get(target), na.rm = TRUE)
+    ),
+    by = Band
+  ]
+
+  res[, Frequency := Claims / Exposure]
+
+  scale_factor <- max(res$Exposure) /
+                  max(res$Frequency)
+
+  p <- ggplot(res, aes(x = Band)) +
+    geom_col(
+      aes(y = Exposure),
+      fill = "lightblue",
+      alpha = 0.8
+    ) +
+    geom_line(
+      aes(y = Frequency * scale_factor, group = 1),
+      color = "red",
+      linewidth = 1.2
+    ) +
+    geom_point(
+      aes(y = Frequency * scale_factor),
+      color = "red",
+      size = 2
+    ) +
+    scale_y_continuous(
+      name = "Exposure",
+      sec.axis = sec_axis(
+        ~ . / scale_factor,
+        name = "Claim Frequency"
+      )
+    ) +
+    labs(
+      title = paste("Exposure and Claim Frequency by", var),
+      x = var
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      )
+    )
+
+  print(p)
+
+  invisible(res)
+}
+
+for (v in continuous_vars) {
+  freq_cont_plot(dt, v)
+}
+```
+Before doing any tghing else, how is the claim frequency distributed ? poisson ? or negative binomial ? 
+```{r}
+cat("the mean of the nb_claim is :", mean(dt$NB_Claim), "the variance is", var(dt$NB_Claim) )
+# variance is higher so we choose negative binomiale as distribution for nb_claim
+
+```
+
+
+In doing my model, i need to decide how to represent the continuous variables rlationships with the frequency 
+wether considering a linear relationship but by bands or a non linear one 
+represented byba spline.and keep the
 simplest form that isn't measurably worse than the best one.
 
 ```{r form-selection-fn}
-poisson_deviance <- function(y, mu) 2 * sum(ifelse(y == 0, mu, y * log(y / mu) - (y - mu)))
+poisson_deviance <- function(y, pred) 2 * sum(ifelse(y == 0, pred, y * log(y / pred) - (y - pred)))
 
-choose_var_form <- function(var, train, valid, target = "NB_Claim", exposure = "Exposure",
+choose_var_form_dev <- function(var, train, valid, target = "NB_Claim", exposure = "Exposure",
                              nbands = 6, df_spline = 4) {
   br <- unique(quantile(train[[var]], probs = seq(0, 1, length.out = nbands + 1), na.rm = TRUE))
   br[1] <- -Inf; br[length(br)] <- Inf
@@ -161,9 +234,45 @@ choose_var_form <- function(var, train, valid, target = "NB_Claim", exposure = "
 }
 ```
 
-```{r form-selection-run}
-continuous_vars <- c("Insured.age", "Car.age", "Credit.score", "Years.noclaims", "Annual.miles.drive")
-form_results <- rbindlist(lapply(continuous_vars, choose_var_form, train = train, valid = valid))
+
+now same but for negative binomial log likelihood 
+```{r}
+neg_log_like <- function(y, mu, theta) -sum(dnbinom(x=y, mu=mu, size = theta, log=TRUE))
+
+choose_var_form_neg <- function(var, train, valid, target = "NB_Claim", exposure = "Exposure",
+                             nbands = 6, df_spline = 4) {
+  br <- unique(quantile(train[[var]], probs = seq(0, 1, length.out = nbands + 1), na.rm = TRUE))
+  br[1] <- -Inf; br[length(br)] <- Inf
+
+  tr <- copy(train); va <- copy(valid)
+  tr[, band := cut(get(var), breaks = br, include.lowest = TRUE)]
+  va[, band := cut(get(var), breaks = br, include.lowest = TRUE)]
+
+  f_lin    <- reformulate(c(var, sprintf("offset(log(%s))", exposure)), response = target)
+  f_spline <- reformulate(c(sprintf("splines::ns(%s, df = %d)", var, df_spline),
+                             sprintf("offset(log(%s))", exposure)), response = target)
+  f_band   <- reformulate(c("band", sprintf("offset(log(%s))", exposure)), response = target)
+
+  m_lin <- MASS :: glm.nb(f_lin, data = tr)
+  m_spl <- glm.nb(f_spline, data = tr)
+  m_bnd <- glm.nb(f_band, data = tr)
+
+  data.table(
+    variable = var, form = c("linear", "spline_df4", "bands"),
+    n_params = c(1, df_spline, nlevels(tr$band) - 1),
+    valid_nb_ll = c(
+      neg_log_like(va[[target]], predict(m_lin, va, type = "response"), m_lin$theta),
+      neg_log_like(va[[target]], predict(m_spl, va, type = "response"), m_spl$theta),
+      neg_log_like(va[[target]], predict(m_bnd, va, type = "response"), m_bnd$theta)
+    )
+  )
+}
+```
+
+now we choose the most appropriate form to represnete each continous variable based
+on the poisson deviance and negative log likelihood(since negative , the lower the better )
+```{r form-selection-run poisson deviance }
+form_results <- rbindlist(lapply(continuous_vars, choose_var_form_dev, train = train, valid = valid))
 print(form_results)
 
 ## Decision rule: among forms within 0.05% of the best validation deviance for that
@@ -177,6 +286,22 @@ cat("\nchosen forms:\n")
 print(decision[, .(variable, form, n_params, valid_deviance)])
 ```
 
+```{r form-selection-run negative_log_likelihood }
+form_results2 <- rbindlist(lapply(continuous_vars, choose_var_form_neg, train = train, valid = valid))
+print(form_results2)
+
+## Decision rule: among forms within 0.05% of the best validation deviance for that
+## variable, keep the one with the fewest parameters (ties: linear < spline < bands)
+form_order <- c(linear = 1, spline_df4 = 2, bands = 3)
+decision2 <- form_results2[
+  , .SD[valid_nb_ll <= min(valid_nb_ll) * 1.0005][order(n_params, form_order[form])][1],
+  by = variable
+]
+cat("\nchosen forms:\n")
+print(decision2[, .(variable, form, n_params, valid_nb_ll)])
+```
+
+Both poisson deviance and negative binomial log likelihood agree that 
 Everything wants a spline except `Car.age`, which the *out-of-sample* deviance says
 is adequately linear. That's a useful result in itself: an in-sample, one-way-plot
 read of `Car.age` can look like it has a non-monotone "shoulder", but that shape
@@ -184,10 +309,9 @@ doesn't survive a held-out check — a small illustration of exactly why this me
 (validated out of sample, not eyeballed) is the more defensible one to use uniformly.
 
 ```{r form-selection-materialise}
-## materialise the chosen form as a model term, generically -- works regardless of
-## which form wins for which variable, so nothing needs to be hand-wired per variable
+## materialise the chosen form as a model term, 
 make_term <- function(v, df_spline = 4, nbands = 6) {
-  frm <- decision[variable == v, form]
+  frm <- decision2[variable == v, form]
   if (frm == "linear") return(v)
   if (frm == "spline_df4") return(sprintf("splines::ns(%s, df = %d)", v, df_spline))
   br <- unique(quantile(train[[v]], probs = seq(0, 1, length.out = nbands + 1), na.rm = TRUE))
@@ -205,20 +329,26 @@ print(continuous_terms)
 # 3. Categorical variables and telematics collinearity
 
 ## 3.1 Categorical variables
+a look at the exposure and frequency by caetgorical variables int he 
 
 ```{r cat-freq}
 categorical_vars <- c("Insured.sex", "Marital", "Region", "Car.use")
-freq_by_cat <- function(v, data = train) {
+freq_by_cat <- function(v, data = dt) {
   data[, .(Exposure = sum(Exposure), Claims = sum(NB_Claim)), by = v][
     , Frequency := Claims / Exposure][order(-Exposure)]
 }
 for (v in categorical_vars) { cat("\n--", v, "--\n"); print(freq_by_cat(v)) }
 ```
+- we are more exposed to male policyholders, we have more claims for males, 
+yet less frequency, so everything else held constant , malke have less frequencies 
 
-`Car.use`'s `Farmer` and `Commercial` levels carry very little exposure — their
-observed frequencies would be unstable in a GLM. Rather than assume which larger
-group they resemble, merge each small level into whichever big level (`Commute`,
-`Private`) has the closest observed frequency **on `train`**:
+- we have about twice the exposure to married people, and they have lower frequencies ceteris paribus 
+
+- We have about 4 times the exposure to Urban regions, and they have higher frequencies ceteris parisbus 
+
+- Farmers have the lowest frequency, and commute have the highest frequency, 
+but we have too low exposure to commercial and farmer which may affect our models performance and prudence 
+we will merge those two into the bigger level rhqt is Commute 
 
 ```{r car-use-merge}
 cu <- freq_by_cat("Car.use")
@@ -240,16 +370,17 @@ table(train$Car.use, train$Car.use.grp)
 ```
 
 ```{r cat-plot}
+categorical_vars <- c(categorical_vars, "Car.use.grp")
 for (v in categorical_vars) print(
-  ggplot(freq_by_cat(v), aes(reorder(get(v), Frequency), Frequency)) +
+  ggplot(freq_by_cat(v, data = train), aes(reorder(get(v), Frequency), Frequency)) +
     geom_col(fill = "steelblue") + coord_flip() +
     labs(title = paste("Observed frequency by", v), x = NULL) + theme_minimal()
 )
 ```
-
+convert the categorical variables to factors in the datasets 
 ```{r cat-to-factor}
 to_factor <- function(d, v, lev) d[, (v) := factor(get(v), levels = lev)]
-for (v in c("Insured.sex", "Marital", "Region")) {
+for (v in c("Insured.sex", "Marital", "Region")) { # Car.use.grp is already a factor
   lev <- sort(unique(train[[v]]))
   to_factor(train, v, lev); to_factor(valid, v, lev); to_factor(test, v, lev)
 }
@@ -286,24 +417,26 @@ cat("highly correlated pairs (|r|>0.9):", nrow(pairs_dt), "\n")
 head(pairs_dt, 10)
 ```
 
-For the GLM-B benchmark (the paper's "hand-engineered features" comparison point),
-pick **one representative per collinear family** — the threshold with the lowest
+For the GLM-B benchmark (I will choose one variable by covariate family 
 univariate AIC against the target, so the choice is data-driven rather than an
 arbitrary pick of the harshest threshold:
 
 ```{r telematics-shortlist}
+# calcule aics for a group of variables and returns the set that return the lowest AIC 
+# then we will pick the best per family of telemeatrics data 
 family_best <- function(vars) {
   aics <- sapply(vars, function(v) {
     f <- reformulate(c(v, "offset(log(Exposure))"), response = "NB_Claim")
-    AIC(glm(f, data = train, family = poisson()))
+    # AIC(glm(f, data = train, family = poisson()))
+    AIC(glm.nb(f, data = train)) # using NB distribution
   })
   names(which.min(aics))
 }
 accel_best <- family_best(c("Accel.06miles","Accel.08miles","Accel.09miles","Accel.11miles","Accel.12miles","Accel.14miles"))
 brake_best <- family_best(c("Brake.06miles","Brake.08miles","Brake.09miles","Brake.11miles","Brake.12miles","Brake.14miles"))
 lturn_best <- family_best(c("Left.turn.intensity08","Left.turn.intensity09","Left.turn.intensity10","Left.turn.intensity11","Left.turn.intensity12"))
-rturn_best <- family_best(c("Right.turn.intensity08","Right.turn.intensity09","Right.turn.intensity10","Right.turn.intensity11","Right.turn.intensity12"))
-cat("family representatives:", accel_best, brake_best, lturn_best, rturn_best, "\n")
+rturn_best <- family_best(c("Right.turn.intensity08","Right.turn.intensity09","Right.turn.intensity10",
+                            "Right.turn.intensity11","Right.turn.intensity12"))
 
 ## keep brake_best / lturn_best; accel_best and rturn_best are near-duplicates of them
 telematics_glmB <- c("Total.miles.driven", "Avgdays.week", "Pct.drive.wkend",
@@ -316,42 +449,43 @@ telematics_glmB
 ## 4.1 GLM-A (traditional only) and GLM-B (traditional + hand-picked telematics)
 
 ```{r glmA-glmB}
+# model A uses only the policy data 
 rhs_trad <- c(unname(continuous_terms), "Insured.sex", "Marital", "Region", "Car.use.grp")
 f_glmA <- reformulate(c(rhs_trad, "offset(log(Exposure))"), response = "NB_Claim")
 glmA_pois <- glm(f_glmA, data = train, family = poisson())
-
+# hte second model uses + telematric best family data 
 rhs_full <- c(rhs_trad, telematics_glmB)
 f_glmB <- reformulate(c(rhs_full, "offset(log(Exposure))"), response = "NB_Claim")
 glmB_pois_full <- glm(f_glmB, data = train, family = poisson())
 
 car::vif(glmB_pois_full)
 ```
-
 VIFs (per-df adjusted, `GVIF^(1/(2*Df))`) are all comfortably under 1.5 — the
 family-representative screen already resolved the collinearity that mattered.
 
-One significance-pruning pass (`drop1`, not the duplicated/buggy stepwise blocks from
-the earlier version of this notebook — one clean pass is enough here since GLM-B is
-deliberately a hand-picked benchmark, not a data-mined model):
+testing the significativity of all bvariables in the full glmB model 
 
 ```{r glmB-prune}
 d1 <- drop1(glmB_pois_full, test = "Chisq")
 print(d1)
-
+# dropping the ones that are not statistically significants 
 drop_terms <- rownames(d1)[which(d1$`Pr(>Chi)` > 0.05)]
-cat("dropped (p > 0.05):", if (length(drop_terms)) drop_terms else "none", "\n")
-
-f_glmB <- if (length(drop_terms)) update(f_glmB, paste(". ~ . -", paste(drop_terms, collapse = " - "))) else f_glmB
+drop_terms
+# the variables Insured.sex; Marital ; Car.use.grep ; Avg.day.wk ; are bnot statiscticaly significants so we 
+# drop them then update the glmB 
+f_glmB <- update(f_glmB, paste(". ~ . -", paste(drop_terms, collapse = " - "))) 
 glmB_pois <- glm(f_glmB, data = train, family = poisson())
 f_glmB
 ```
 
 ```{r glmA-glmB-validate}
+# fnc that calculate the poisson deviance training / validation dataset 
 val_dev <- function(m, newdata) poisson_deviance(newdata$NB_Claim, predict(m, newdata, type = "response"))
+
 cat(sprintf("validation Poisson deviance -- GLM-A: %.1f | GLM-B: %.1f\n", val_dev(glmA_pois, valid), val_dev(glmB_pois, valid)))
 ```
-
-GLM-B materially beats GLM-A out of sample — telematics carry real signal even
+GLM-B has a far lower deviance on validation set and 
+materially beats GLM-A out of sample — telematics carry real signal even
 through a hand-picked, log-linear lens.
 
 ## 4.2 Dispersion diagnostics: does this portfolio need Negative Binomial?
@@ -396,16 +530,23 @@ Poisson-Gamma mixture interpretation, α̂ measures unobserved heterogeneity ("f
 the rating factors don't capture — and telematics explain part of it. NB is used from
 here on as the primary distributional family, per the LR test above.
 
+The telematics information captures latent risk characteristics and significantly 
+reduces unobserved heterogeneity within the portfolio.
+
+and since : the p- value is less than 5% I strongly reject the Poisson assumption.
+There is highly significant evidence of overdispersion in the claim counts. 
+The Poisson model understates the variability observed in the data, 
+and the Negative Binomial model provides a statistically superior fit.
+
 # 5. The CANN
 
-## 5.1 Architecture
+## 5.1 Architecture, of the model 
 
 ```
-log(mu_i) = log(exposure_i)          <- offset
+log(mu_i) = log(exposure_i)          <- offset of exposure
           + x_i^trad . beta          <- log-linear ("actuarial") part: TRADITIONAL factors only
           + MLP(x_i^trad, x_i^tele)  <- network part: traditional AND telematics
 ```
-
 The log-linear part is deliberately restricted to traditional factors — it's the
 stable, interpretable backbone, and it's exactly GLM-A's formula (`f_glmA`) so the
 warm start below is well-defined. The MLP receives traditional factors (raw, not
@@ -422,6 +563,7 @@ likelihood.
 suppressPackageStartupMessages(library(torch))
 
 mm <- function(formula, data) model.matrix(delete.response(terms(formula)), data)
+
 X_trad_train <- mm(f_glmA, train); X_trad_valid <- mm(f_glmA, valid); X_trad_test <- mm(f_glmA, test)
 stopifnot(identical(colnames(X_trad_train), names(coef(glmA_pois))))
 
@@ -441,9 +583,12 @@ mlp_input <- function(data) cbind(
   model.matrix(~ . - 1, data[, ..trad_dummies]),
   scale_block(data, telematics_all, tele_stats)
 )
-X_mlp_train <- mlp_input(train); X_mlp_valid <- mlp_input(valid); X_mlp_test <- mlp_input(test)
+X_mlp_train <- mlp_input(train); 
+X_mlp_valid <- mlp_input(valid); 
+X_mlp_test <- mlp_input(test)
 
 offset_train <- log(train$Exposure); offset_valid <- log(valid$Exposure); offset_test <- log(test$Exposure)
+
 y_train <- train$NB_Claim; y_valid <- valid$NB_Claim; y_test <- test$NB_Claim
 beta_glm <- coef(glmA_pois)
 cat("X_trad:", dim(X_trad_train), " | X_mlp:", dim(X_mlp_train), "\n")
@@ -502,20 +647,21 @@ nb_nll <- function(eta, y, log_r) {
 fit_cann <- function(head = c("poisson", "nb"), seed = 1, epochs = 100, patience = 10,
                       lr = 1e-3, batch_size = 1024, verbose = FALSE) {
   head <- match.arg(head)
-  torch_manual_seed(seed); set.seed(seed)
+ # torch_manual_seed(seed); 
+  set.seed(seed)
 
-  net <- cann_module(ncol(X_trad_train) - 1, ncol(X_mlp_train), beta_glm)
+  net <- cann_module(ncol(X_trad_train) - 1, ncol(X_mlp_train), beta_glm)#network buid
   opt <- optim_adam(net$parameters, lr = lr)
-
+# training tensors : are matrices 
   Xt_tr <- torch_tensor(X_trad_train[, -1, drop = FALSE], dtype = torch_float())
   Xm_tr <- torch_tensor(X_mlp_train, dtype = torch_float())
   y_tr  <- torch_tensor(y_train, dtype = torch_float())
-  off_tr <- torch_tensor(offset_train, dtype = torch_float())
-
+  off_tr <- torch_tensor(offset_train, dtype = torch_float()) # ecxposure offset 
+# validation tensors 
   Xt_va <- torch_tensor(X_trad_valid[, -1, drop = FALSE], dtype = torch_float())
   Xm_va <- torch_tensor(X_mlp_valid, dtype = torch_float())
   y_va  <- torch_tensor(y_valid, dtype = torch_float())
-  off_va <- torch_tensor(offset_valid, dtype = torch_float())
+  off_va <- torch_tensor(offset_valid, dtype = torch_float()) # exposure log offset 
 
   n <- nrow(X_trad_train); best_val <- Inf; best_state <- NULL; bad_epochs <- 0
   for (epoch in seq_len(epochs)) {
@@ -547,6 +693,7 @@ fit_cann <- function(head = c("poisson", "nb"), seed = 1, epochs = 100, patience
   net$load_state_dict(best_state); net$eval()
   list(net = net, best_val_nll = best_val, head = head, seed = seed, epochs_run = epoch)
 }
+# now preditions of 
 
 predict_cann <- function(fit, X_trad, X_mlp, offset) {
   net <- fit$net; net$eval()
@@ -555,6 +702,7 @@ predict_cann <- function(fit, X_trad, X_mlp, offset) {
                torch_tensor(X_mlp, dtype = torch_float()),
                torch_tensor(offset, dtype = torch_float()))
   })
+  # the return are floats so convert to integer
   as.numeric(torch_exp(eta))
 }
 ```
