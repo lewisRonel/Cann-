@@ -1,0 +1,1244 @@
+---
+title: "Car_accidents_benchmark_Claim Count Modelling"
+output: html_notebook
+---
+# BAckground and justification 
+
+novel cross-sectional claim count models for vehicle insurance built upon the combinedd actuarial neural network (CANN) framework proposed by Wüthrich and Merz. The CANN approach combines a classical actuarial model, such as a generalized linear model, with a neural network. This blending of models results in a two-component model comprising a classical regression model and a neural network part. 
+
+The CANN model leverages the strengths of both components, providing a solid foundation and interpretability from the classical model while harnessing the flexibility and capacity to capture intricate relationships and interactions offered by the neural network. In our proposed models, we use well-known log-linear claim count regression models for the classical regression part and a multilayer perceptron (MLP) for the neural network part. The MLP part is used to process telematics car driving data given as a vector characterizing the driving behavior of each insured driver. 
+
+Reproduction of the cross-sectional models of Duval, Boucher & Pigeon (2024), fit on
+the public So, Boucher & Valdez (2021) synthetic telematics portfolio.
+The objectif is to compare and constrast the predictive and interpretatbility of 
+- a glm model 
+- a glm model + a neural network layer to model the non ,linearity of telematrics 
+
+# 0. Setup
+```{r libraries setup}
+suppressPackageStartupMessages({
+  library(data.table)   # data wrangling
+  library(dplyr)         # a few readable verbs (case_when, mutate)
+  library(ggplot2)       # plotting
+  library(ggcorrplot)    # correlation heatmap
+  library(MASS)           # glm.nb
+  library(splines)        # ns()
+  library(AER)             # dispersiontest (Cameron-Trivedi)
+  library(pscl)            # pR2
+  library(car)             # vif
+  library(glmnet)          # kept for reference; not used in the final variable-selection path
+  # library(torch)  
+  library(keras3)# CANN
+  library(tidyr)
+  library(plotly)
+  library(corrplot)
+  library(DescTools)
+  library(torch)
+})
+
+```
+
+# 1. Data loading
+
+```{r load and structural checks}
+dt <- fread("telematics_syn-032021.csv") # faster than read_csv and handles separators directly 
+cat("dim:", dim(dt), "\n")
+
+```
+Our dataset has 100 thousands observations and 52 variables. some of those variables 
+are standard like Insured.age and Sex,. we also had data on the driving habits like 
+the intensity of brakes or turn , as well as NB_claim and AMT _claims 
+
+# 2. Data cleaning and exposure check 
+
+```{r structural-checks}
+
+cat("missing values:", sum(is.na(dt)), " | duplicate rows:", sum(duplicated(dt)), "\n")
+table(dt$Insured.sex, dt$Marital)
+table(dt$Car.use, dt$Region)
+```
+ 
+- No missing values. 
+- Insured.sex (Male/Female), 
+- Region (Urban/Rural) are binary. 
+- Car.use has 4 levels (Commercial, Commute, Farmer, Private), two of which carry very little exposure 
+
+Two columns have spaces in their names which might pose issues later on. 
+To be correted now 
+
+Territory is a catgeorical variable that has about 55 levels, with no hierachy to bin it. As there is too much cardinality, we 
+would rather just drop it from the dataset. 
+
+CarAge has neative values which is not possible, hence those must be mistakes, 
+```{r Cleaning}
+dt[, Territory := NULL]
+dt[Car.age < 0, .N]/100000  # about 2 % ot total observations, replace by median 
+med_car_age <- median(dt[Car.age >= 0, Car.age])
+dt[Car.age < 0, Car.age := med_car_age]
+setnames(dt, c("Pct.drive.rush am", "Pct.drive.rush pm"), # old names 
+             c("Pct.drive.rush.am", "Pct.drive.rush.pm")) # new names 
+```
+
+# 3 Data visualisation
+
+## 3.1 Exposure and frequency  
+```{r Data-viz _ exposure}
+dt[, Exposure := Duration / 365]  # Duration is in DAYS, so we convert to years 
+summary(dt$Exposure)
+
+table(dt$NB_Claim)
+cat(sprintf("policies with >=1 claim: %d (%.2f%%)\n", dt[NB_Claim > 0, .N], 100 * dt[NB_Claim > 0, .N] / nrow(dt)))
+cat("portfolio frequency using NB_claim:", dt[, sum(NB_Claim) / sum(Exposure)], "\n")
+cat("portfolio frequency using AMT_claim:", dt[, sum(AMT_Claim) / sum(Exposure)], "\n")
+```
+No contract has more than 3 claims; ~4.3% of policies have at least one claim.
+
+exposure and frequency graph  by variable(age , sex ,carAge, Credit scoreYears no claims  )
+
+```{r expo_freq plot function}
+
+plot_freq_expo <- function(data, var, var_categorical) {
+  
+  summary_df <- data %>%
+    group_by(.data[[var]], .data[[var_categorical]]) %>%
+    summarise(
+      Exposure = sum(Exposure, na.rm = TRUE),
+      Claims = sum(NB_Claim, na.rm = TRUE),
+      Frequency = Claims / Exposure,
+      .groups = "drop"
+    )
+  
+  max_expo <- max(summary_df$Exposure, na.rm = TRUE)
+  
+  ggplot(summary_df,
+         aes(x = .data[[var]],
+             colour = .data[[var_categorical]],
+             fill = .data[[var_categorical]])) +
+    
+    geom_col(
+      aes(y = Exposure),
+      position = position_dodge(width = 0.8),
+      alpha = 0.5
+    ) +
+    
+    geom_line(
+      aes(
+        y = Frequency * max_expo,
+        group = .data[[var_categorical]]
+      ),
+      linewidth = 1.2
+    ) +
+    
+    
+    scale_y_continuous(
+      name = "Exposure",
+      sec.axis = sec_axis(
+        ~ . / max_expo,
+        name = "Frequency"
+      )
+    ) +
+    
+    labs(
+      title = paste("Exposure and Frequency by", var),
+      x = var,
+      colour = var_categorical,
+      fill = var_categorical
+    ) +
+    
+    theme_minimal()
+}
+```
+### 3.1.1 BY iNSURED (sEX)
+
+```{r}
+
+plot_freq_expo(dt, "Car.age", "Insured.sex")
+plot_freq_expo(dt, "Years.noclaims", "Insured.sex")
+plot_freq_expo(dt, "Insured.age", "Insured.sex")
+
+
+```
+
+just like we tought , we are mre exposed to male policyholders, lets have a focus 
+on observed frequencies by Insured.age 
+### 3.1.2 BY MARITAL STATUS 
+
+```{r}
+plot_freq_expo(dt, "Car.age", "Marital")
+plot_freq_expo(dt, "Years.noclaims", "Marital")
+plot_freq_expo(dt, "Insured.age", "Marital")
+```
+We aere a lot more exposed to married clients, and single people seems to 
+have a higher frequency 
+### 3.1.2 BY Car use  
+
+```{r}
+plot_freq_expo(dt, "Car.age", "Car.use")
+plot_freq_expo(dt, "Years.noclaims", "Car.use")
+plot_freq_expo(dt, "Insured.age", "Car.use")
+```
+## Frequency by Insured.age
+```{r observed freq_table}
+freq_table <- function(data, var){
+
+  data %>%
+    group_by(.data[[var]]) %>%
+    summarise(
+      Exposure = sum(Exposure, na.rm = TRUE),
+      Claims = sum(NB_Claim, na.rm = TRUE),
+      Frequency = Claims / Exposure,
+      .groups = "drop"
+    ) %>%
+    dplyr::select(all_of(var), Frequency)
+}
+
+# Pour Insured.age
+age_freq_table = freq_table(dt, "Insured.age")
+age_freq_table
+
+```
+
+
+```{r}
+plot_freq_expo_plotly <- function(data, var = "Insured.age") {
+
+  summary_df <- data %>%
+    group_by(.data[[var]]) %>%
+    summarise(
+      Exposure = sum(Exposure, na.rm = TRUE),
+      Claims = sum(NB_Claim, na.rm = TRUE),
+      Frequency = Claims / Exposure,
+      .groups = "drop"
+    )
+
+  plotly::plot_ly(summary_df) %>%
+
+    add_bars(
+      x = ~.data[[var]],
+      y = ~Exposure,
+      name = "Exposure",
+      marker = list(color = "skyblue"),
+      opacity = 0.7,
+      yaxis = "y"
+    ) %>%
+
+    add_lines(
+      x = ~.data[[var]],
+      y = ~Frequency,
+      name = "Frequency",
+      line = list(color = "red", width = 3),
+      yaxis = "y2"
+    ) %>%
+
+    add_markers(
+      x = ~.data[[var]],
+      y = ~Frequency,
+      name = "Frequency",
+      marker = list(color = "red", size = 6),
+      yaxis = "y2"
+    ) %>%
+
+    plotly::layout(
+      title = paste("Exposure and Frequency by", var),
+
+      xaxis = list(
+        title = var
+      ),
+
+      yaxis = list(
+        title = "Exposure",
+        side = "left"
+      ),
+
+      yaxis2 = list(
+        title = "Frequency",
+        overlaying = "y",
+        side = "right",
+        showgrid = FALSE
+      )
+    )
+}
+plot_freq_expo_plotly(dt)
+```
+
+### 3.2 CATEGORICAL VARIABLES 
+ look at the exposure and frequency by caetgorical variables int he
+
+```{r cat-freq}
+categorical_vars <- c("Insured.sex", "Marital", "Region", "Car.use")
+freq_by_cat <- function(v, data = dt) {
+  data[, .(Exposure = sum(Exposure), Claims = sum(NB_Claim)), by = v][
+    , Frequency := Claims / Exposure][order(-Exposure)]
+}
+for (v in categorical_vars) { cat("\n--", v, "--\n"); print(freq_by_cat(v)) }
+
+```
+- we are more exposed to male policyholders, we have more claims for males, yet lower frequency, so everything else held constant , male have less frequencies
+
+- we have about twice the exposure to married people, and they have lower frequencies ceteris paribus
+
+- We have about 4 times the exposure to Urban regions, and they have higher frequencies ceteris parisbus
+
+- Farmers have the lowest frequency, and commute have the highest frequency, but we have too low exposure to commercial and farmer which may affect our models performance and prudence we will merge those two together as Commerial_farmer
+
+```{r car use merging }
+dt[, Car.use.grp := fifelse(
+  Car.use %in% c("Commercial", "Farmer"),
+  "Farmer_Commercial",
+  Car.use
+)]
+
+
+dt[, Car.use.grp := factor(Car.use.grp)]
+dt[, Car.use := NULL]
+```
+
+### 3.2.2 encoding categorical vars into factors 
+```{r categorical_to_factors}
+# function to transform to factors 
+to_factor <- function(d, v, lev) d[, (v) := factor(get(v), levels = lev)]
+for (v in c("Insured.sex", "Marital", "Region")) { 
+  lev <- sort(unique(dt[[v]]))
+  to_factor(dt, v, lev)
+}
+```
+
+#4 Colinearity vs Multicolinearity
+
+```{r}
+dt[, Duration :=NULL]
+amt_claim = dt[, AMT_Claim]
+dt[, AMT_Claim :=NULL]
+# calculating colinearity of all independants variables with NB_Claim
+num_vars <- c("Insured.age", "Car.age", "Years.noclaims", "Credit.score","Annual.pct.driven")
+telematics_vars <- c(
+  #"Annual.miles.drive",
+  "Annual.pct.driven",
+  "Total.miles.driven",
+  "Pct.drive.mon",
+  "Pct.drive.tue",
+  "Pct.drive.wed",
+  "Pct.drive.thr",
+  "Pct.drive.fri",
+  "Pct.drive.sat",
+  "Pct.drive.sun",
+  "Pct.drive.2hrs",
+  "Pct.drive.3hrs",
+  "Pct.drive.4hrs",
+  "Pct.drive.wkday",
+  "Pct.drive.wkend",
+  "Pct.drive.rush.am",
+  "Pct.drive.rush.pm",
+  "Avgdays.week",
+  "Accel.06miles",
+  "Accel.08miles",
+  "Accel.09miles",
+  "Accel.11miles",
+  "Accel.12miles",
+  "Accel.14miles",
+  "Brake.06miles",
+  "Brake.08miles",
+  "Brake.09miles",
+  "Brake.11miles",
+  "Brake.12miles",
+  "Brake.14miles",
+  "Left.turn.intensity08",
+  "Left.turn.intensity09",
+  "Left.turn.intensity10",
+  "Left.turn.intensity11",
+  "Left.turn.intensity12",
+  "Right.turn.intensity08",
+  "Right.turn.intensity09",
+  "Right.turn.intensity10",
+  "Right.turn.intensity11",
+  "Right.turn.intensity12"
+)
+sapply(
+  dt[, ..num_vars],
+  function(x) cor(x, dt$NB_Claim, use = "complete.obs")
+)
+sapply(
+  dt[, ..telematics_vars],
+  function(x) cor(x, dt$NB_Claim, use = "complete.obs")
+)
+```
+###  distribution of NB_claims
+
+```{r}
+
+claims_dist <- dt %>%
+  count(NB_Claim)
+
+plot_ly(
+  claims_dist,
+  x = ~NB_Claim,
+  y = ~n,
+  type = "bar"
+) %>%
+  plotly::layout(
+    title = "Distribution of Number of Claims",
+    xaxis = list(title = "Number of Claims"),
+    yaxis = list(title = "Number of Policies")
+  )
+```
+
+###4.1.1 Negative binomial vs Poisson distribuition QQplot 
+
+if the variance is quite superieor to the mean then we have overdispersion and
+NB distribution is more appropriate 
+```{r}
+mean(dt$NB_Claim)
+var(dt$NB_Claim)
+dispersion <- var(dt$NB_Claim) / mean(dt$NB_Claim)
+
+dispersion
+```
+very low overdispersion so Poisson might be more approriate 
+#### Fit Poissona nd NB 
+```{r}
+library(MASS)
+
+# Parameters estimated from the data
+lambda <- mean(dt$NB_Claim)
+
+fit_nb <- fitdistr(dt$NB_Claim, "Negative Binomial")
+
+size <- fit_nb$estimate["size"]
+mu   <- fit_nb$estimate["mu"]
+```
+
+#### Combined Poisson vs NB comparison
+```{r}
+obs <- sort(dt$NB_Claim)
+
+n <- length(obs)
+# theorical poisson quantiles 
+theo_pois <- qpois(
+  ppoints(n),
+  lambda = lambda
+)
+#theorical NB quantiles 
+theo_nb <- qnbinom(
+  ppoints(n),
+  size = size,
+  mu = mu
+)
+par(mfrow = c(1, 2))
+
+qqplot(theo_pois, obs,
+       main = "Poisson",
+       pch = 19, col = "blue")
+abline(0, 1, col = "red", lwd = 2)
+
+qqplot(theo_nb, obs,
+       main = "Negative Binomial",
+       pch = 19, col = "darkgreen")
+abline(0, 1, col = "red", lwd = 2)
+```
+we will now can compare:
+
+Empirical distribution of NB_Claim
+Fitted Poisson distribution
+Fitted Negative Binomial distribution
+
+on the same graph.(explique m=what is being done , )
+```{r}
+
+# Observed distribution
+obs <- dt %>%
+  count(NB_Claim) %>%
+  mutate(
+    Prob = n / sum(n)
+  )
+
+# Support
+k <- 0:max(dt$NB_Claim)
+
+fit_df <- data.frame(
+  NB_Claim = k,
+  Poisson = dpois(k, lambda),
+  NegBin  = dnbinom(k, size = size, mu = mu)
+)
+
+# Plot
+ggplot() +
+  geom_col(
+    data = obs,
+    aes(x = NB_Claim, y = Prob),
+    fill = "grey70",
+    alpha = 0.7
+  ) +
+  geom_line(
+    data = fit_df,
+    aes(x = NB_Claim, y = Poisson, colour = "Poisson"),
+    linewidth = 1.2
+  ) +
+  geom_point(
+    data = fit_df,
+    aes(x = NB_Claim, y = Poisson, colour = "Poisson")
+  ) +
+  geom_line(
+    data = fit_df,
+    aes(x = NB_Claim, y = NegBin, colour = "Negative Binomial"),
+    linewidth = 1.2
+  ) +
+  geom_point(
+    data = fit_df,
+    aes(x = NB_Claim, y = NegBin, colour = "Negative Binomial")
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Poisson" = "red",
+      "Negative Binomial" = "blue"
+    )
+  ) +
+  labs(
+    title = "Observed vs Fitted Claim Count Distributions",
+    x = "Number of Claims",
+    y = "Probability",
+    colour = "Distribution"
+  ) +
+  theme_minimal()
+```
+
+we will now compare AIC directly (what is AIC ?) 
+```{r}
+pois_fit <- glm(
+  NB_Claim ~ 1,
+  family = poisson,
+  data = dt
+)
+
+nb_fit <- MASS::glm.nb(
+  NB_Claim ~ 1,
+  data = dt
+)
+
+AIC(pois_fit, nb_fit)
+```
+the AIC is very close to each other , with a slight edge on NB ,so we will use bothe distriubution and compare them on their predictability capaity
+
+#5 Model construction
+
+## 5.1 Split the dataset into trainig and testing 
+```{r split}
+# new column that tells us if there is a claim or not 
+dt[, HasClaim := as.integer(NB_Claim > 0)]
+
+stratified_split <- function(n_idx, strata, p_train = 0.8, seed = 123) {
+  set.seed(seed)
+  parts <- lapply(split(n_idx, strata), function(idx) {
+    idx <- sample(idx); n <- length(idx)
+    n_tr <- floor(p_train * n)
+    list(train = idx[seq_len(n_tr)],
+         
+         test  = idx[-seq_len(n_tr)])
+  })
+  list(train = unlist(lapply(parts, `[[`, "train"), use.names = FALSE),
+       test  = unlist(lapply(parts, `[[`, "test"),  use.names = FALSE))
+}
+sp <- stratified_split(
+seq_len(nrow(dt)),
+dt$HasClaim,
+p_train = 0.8
+)
+train_dt <- dt[sp$train]
+test_dt <- dt[sp$test]
+
+cat("rows:", nrow(train_dt), nrow(test_dt), "\n")
+cat(
+"claim rate by split:",
+mean(train_dt$HasClaim),
+mean(test_dt$HasClaim), "\n"
+)
+```
+
+first we will construct two models 
+```{r}
+mod0 <- glm(
+NB_Claim ~ 1,
+family = poisson(),
+offset = log(Exposure),
+data = train_dt
+)
+
+mod1 <- MASS::glm.nb(
+NB_Claim ~ offset(log(Exposure)),
+data = train_dt
+)
+```
+
+##5.2 Multicolinearity Check
+
+### 5.2.2 Continuous variables 
+first we separate the numeric and categorcical variables 
+```{r}
+
+# matrice de correlation 
+cor_mat <- cor(
+  train_dt[, ..num_vars],
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+cor_mat2 <- cor(
+  train_dt[, ..telematics_vars],
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+# visualisation 
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.7
+)
+corrplot(
+  cor_mat2,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.7
+)
+```
+on observe une très forte correlations entre les variables telmatics. Nous allons 
+les organiser en groupe de variables et calculer les colinearités intra groups puis vif poiur selectionner celles àn agrder dasn chasua egroupe de telematrics en focntion du ritère d'AIC
+
+```{r}
+family_best <- function(vars) {
+  aics <- sapply(vars, function(v) {
+    f <- reformulate(c(v, "offset(log(Exposure))"), response = "NB_Claim")
+    AIC(glm.nb(f, data = train_dt)) # using NB distribution
+  })
+  names(which.min(aics))
+}
+# creating the telematics sub families 
+accel_best <- family_best(c("Accel.06miles","Accel.08miles","Accel.09miles","Accel.11miles","Accel.12miles","Accel.14miles"))
+brake_best <- family_best(c("Brake.06miles","Brake.08miles","Brake.09miles","Brake.11miles","Brake.12miles","Brake.14miles"))
+lturn_best <- family_best(c("Left.turn.intensity08","Left.turn.intensity09","Left.turn.intensity10","Left.turn.intensity11","Left.turn.intensity12"))
+rturn_best <- family_best(c("Right.turn.intensity08","Right.turn.intensity09","Right.turn.intensity10",
+                            "Right.turn.intensity11","Right.turn.intensity12"))
+
+pct_day_best <- family_best(c(
+"Pct.drive.mon",
+"Pct.drive.tue",
+"Pct.drive.wed",
+"Pct.drive.thr",
+"Pct.drive.fri",
+"Pct.drive.sat",
+"Pct.drive.sun"))
+
+pct_time_best <- family_best(c(
+"Pct.drive.2hrs",
+"Pct.drive.3hrs",
+"Pct.drive.4hrs",
+"Pct.drive.wkday",
+"Pct.drive.wkend",
+"Pct.drive.rush.am",
+"Pct.drive.rush.pm"
+))
+
+selected_telematics <- c(
+pct_day_best,
+pct_time_best,
+accel_best,
+brake_best,
+lturn_best,
+rturn_best
+)
+
+selected_telematics
+```
+###  5.2.2 Catégoricals variables multicolinearity 
+Nous pouvons  mesurer leur association avec le package DescTools using the cramers V ; what is it ? 
+how does it work  
+it calculate relationaship fobetween two variables, so we are trying to create a matric 
+to find relationship between all varainles 
+
+```{r}
+cat_vars <- c(
+"Insured.sex",
+"Car.use.grp", 
+"Marital", "Region"
+)
+cramer_mat <- matrix(
+NA,
+nrow = length(cat_vars),
+ncol = length(cat_vars),
+dimnames = list(cat_vars, cat_vars)
+)
+for (i in seq_along(cat_vars)) {
+for (j in seq_along(cat_vars)) {
+cramer_mat[i, j] <- CramerV(
+train_dt[[cat_vars[i]]],
+train_dt[[cat_vars[j]]]
+)}}
+round(cramer_mat, 3)
+```
+Good , there are weak multicolinearity between the categorical variables 
+Now we calculate the final VIF on the complete model 
+exlain vif vs gvif 
+```{r vif }
+final_variables = c(cat_vars, num_vars)
+# comlete model 
+form_vif <- as.formula(
+  paste(
+    "NB_Claim ~",
+    paste(final_variables, collapse = " + "),
+    "+ offset(log(Exposure))"))
+
+mod_vif <- glm.nb(form_vif,data = train_dt)
+v <- vif(mod_vif)
+v
+
+```
+##5.3 Selection of variables 
+
+```{r}
+full_formula <- as.formula(
+  paste(
+    "NB_Claim ~",
+    paste(final_variables, collapse = " + "),
+    "+ offset(log(Exposure))" ))
+
+mod_full_pois <- glm(
+  full_formula,
+  family = poisson(),
+  data = train_dt
+)
+
+mod_full_nb <- MASS::glm.nb(
+  full_formula,
+  data = train_dt
+)
+
+AIC(mod0, mod_full_pois)
+AIC(mod1, mod_full_nb)
+```
+
+### 5.3.1 Test de déviance (Likelihood Ratio Test)
+Est-ce que l'ajout de cette variable améliore significativement le modèle ?
+this will remove one variable and check if it ameliore le AIC 
+```{r}
+drop1(mod_full_nb, test = "Chisq")
+```
+
+
+##5.3.2 Sélection backward automatique avec AIC
+```{r}
+mod_step_nb <- stepAIC(
+  mod_full_nb,
+  direction = "backward",
+  trace = TRUE
+)
+
+summary(mod_step_nb)
+```
+
+what are the variables selected ?
+```{r}
+names(coef(mod_step_nb))
+```
+# 6. Testing on test dataset using mod_full_nb GLM  
+
+
+```{r}
+test_dt$pred_nb <- predict(
+  mod_full_nb,
+  newdata = test_dt,
+  type = "response"
+)
+
+#comparing frequences observes vs prédite modelle full 
+c(
+obs_freq = sum(test_dt$NB_Claim) / sum(test_dt$Exposure),
+pred_freq = sum(test_dt$pred_nb) / sum(test_dt$Exposure)
+)
+```
+```{r}
+# second model step
+test_dt$pred_nb_step <- predict(
+  mod_step_nb,
+  newdata = test_dt,
+  type = "response"
+)
+#comparing frequences observes vs prédite modelle full 
+c(
+obs_freq = sum(test_dt$NB_Claim) / sum(test_dt$Exposure),
+pred_freq = sum(test_dt$pred_nb_step) / sum(test_dt$Exposure)
+)
+```
+
+
+very closed though our predicted frequenies are slighty higner. 
+Lets look at the plot
+```{r predicted_vs_observed frequencies }
+
+plot_age_fit_plotly <- function(data, model) {
+
+  data$pred <- predict(
+    model,
+    newdata = data,
+    type = "response"
+  )
+
+  age_df <- data %>%
+    group_by(Insured.age) %>%
+    summarise(
+      Exposure = sum(Exposure, na.rm = TRUE),
+      Claims_obs = sum(NB_Claim, na.rm = TRUE),
+      Claims_pred = sum(pred, na.rm = TRUE),
+      Obs_Freq = Claims_obs / Exposure,
+      Pred_Freq = Claims_pred / Exposure,
+      .groups = "drop"
+    )
+
+  plot_ly() %>%
+
+    add_bars(
+      data = age_df,
+      x = ~Insured.age,
+      y = ~Exposure,
+      name = "Exposure",
+      marker = list(color = "skyblue"),
+      opacity = 0.6,
+      yaxis = "y"
+    ) %>%
+
+    add_lines(
+      data = age_df,
+      x = ~Insured.age,
+      y = ~Obs_Freq,
+      name = "Observed Frequency",
+      line = list(
+        color = "red",
+        width = 3
+      ),
+      yaxis = "y2"
+    ) %>%
+
+    add_markers(
+      data = age_df,
+      x = ~Insured.age,
+      y = ~Obs_Freq,
+      name = "Observed Frequency",
+      marker = list(
+        color = "red",
+        size = 6
+      ),
+      yaxis = "y2",
+      showlegend = FALSE
+    ) %>%
+
+    add_lines(
+      data = age_df,
+      x = ~Insured.age,
+      y = ~Pred_Freq,
+      name = "Predicted Frequency",
+      line = list(
+        color = "darkgreen",
+        width = 3,
+        dash = "dash"
+      ),
+      yaxis = "y2"
+    ) %>%
+
+    layout(
+      title = "Observed vs Predicted Frequency by Insured Age",
+
+      xaxis = list(
+        title = "Insured Age"
+      ),
+
+      yaxis = list(
+        title = "Exposure"
+      ),
+
+      yaxis2 = list(
+        title = "Frequency",
+        overlaying = "y",
+        side = "right",
+        showgrid = FALSE,
+        tickformat = ".2%"
+      ),
+
+      legend = list(
+        orientation = "h",
+        x = 0.3,
+        y = 1.1
+      )
+    )
+}
+
+plot_age_fit_plotly(test_dt, mod_full_nb)
+```
+
+Not bad , not bad at all 
+```{r}
+plot_age_fit_plotly(test_dt, mod_step_nb)
+```
+
+
+# 7. Diagnostic o the errors of both models 
+
+Given that we're predicting claim counts (NB_Claim) with an exposure offset, we will
+compare (explain each metrics using math formulas ) :
+
+- MAE # erreur aboslute moyenne
+- RMSE # erreur quadratique moyenne 
+- Poisson Deviance
+- Distribution of residuals
+- Observed vs Predicted frequencies
+
+**1.Errors metrics calculations**
+a function to calculate the errors metrics, given the predicted y and the observed yis
+
+```{r calculate_errors_metrics}
+eval_metrics <- function(y, pred) {
+  mae <- mean(abs(y - pred))
+
+  rmse <- sqrt(mean((y - pred)^2))
+
+  poisson_dev <- 2 * sum(
+    ifelse( y == 0,pred,y * log(y / pred) - (y - pred)))
+# create a dataframe to store the errors 
+  data.frame(MAE = mae, RMSE = rmse,PoissonDeviance = poisson_dev)
+}
+# metrics for the full model 
+metrics_nb <- eval_metrics(test_dt$NB_Claim,test_dt$pred_nb)
+# metrics for the step model 
+metrics_step <- eval_metrics(test_dt$NB_Claim, test_dt$pred_nb_step)
+# full metric
+rbind(Full_NB = metrics_nb,Step_NB = metrics_step)
+```
+
+comparions and comments 
+
+**2. Create residuals dataset**
+```{r residuals}
+
+comp_df <- test_dt %>%
+  transmute(
+    NB_Claim,
+
+    resid_full =
+      NB_Claim - pred_nb, # residuals errors using first full model 
+
+    resid_step =
+      NB_Claim - pred_nb_step, # residuals errors using second step model 
+
+    abs_resid_full =
+      abs(NB_Claim - pred_nb), # absolute values 
+
+    abs_resid_step =
+      abs(NB_Claim - pred_nb_step)
+  )
+```
+
+**3. Boxplot of absolute errors**
+```{r boxplot_abs_errors}
+box_df <- comp_df %>%
+  select(abs_resid_full,
+         abs_resid_step) %>%
+  pivot_longer(everything(),  names_to = "Model",values_to = "AbsoluteError")
+
+ggplot(box_df,aes(x = Model, y = AbsoluteError)) +
+  geom_boxplot(fill = "lightblue") +
+  theme_minimal() +
+  labs( title = "Absolute Error Comparison",y = "Absolute Error")
+```
+
+
+comments 
+### 7.2 Observed vs Predicted frequencies by age
+
+```{r}
+freq_compare <- test_dt %>%
+  group_by(Insured.age) %>%
+  summarise(
+    Exposure = sum(Exposure),
+    ObsFreq = sum(NB_Claim) / sum(Exposure),
+    FullNB = sum(pred_nb) / sum(Exposure),
+    StepNB = sum(pred_nb_step) / sum(Exposure),
+    .groups = "drop"
+  )
+```
+
+Plotly the two models and compare with observed frequencies 
+```{r}
+
+plot_ly(freq_compare, x = ~Insured.age) %>%
+
+  add_lines(
+    y = ~ObsFreq,
+    name = "Observed",
+    line = list(color = "black", width = 3)
+  ) %>%
+
+  add_lines(
+    y = ~FullNB,
+    name = "Full NB",
+    line = list(color = "blue")
+  ) %>%
+
+  add_lines(
+    y = ~StepNB,
+    name = "Step NB",
+    line = list(
+      color = "red",
+      dash = "dash"
+    )
+  ) %>%
+
+  layout(
+    title = "Observed vs Predicted Frequency by Age",
+    yaxis = list(
+      title = "Frequency"
+    )
+  )
+```
+
+**Lift chart (my favorite)**
+```{r}
+test_dt$decile <- ntile(
+  test_dt$pred_nb,
+  10
+)
+
+lift_full <- test_dt %>%
+  group_by(decile) %>%
+  summarise(
+    ObsFreq = sum(NB_Claim) / sum(Exposure),
+    PredFreq = sum(pred_nb) / sum(Exposure)
+  )
+```
+
+This quickly shows which model ranks risk best.
+Then compare predicted vs observed by decile.
+If the curves overlap closely, the model calibrates well.
+
+
+# 8. CANN model 
+here we build a neural network that will be initialsed with the glm and trained to 
+understand the hiden non linear relationship hidden in the telematrics datasets 
+The CANN blends a classical regression with a network by adding their linear predictors before the link: 
+
+```
+log( mu_i ) = log(exposure_i)                    <- offset
+            + x_i^trad . beta                    <- log-linear (actuarial) part
+            + MLP( x_i^trad , x_i^tele )         <- network (boosting) part
+```
+Two design decisions carry the whole idea and must not be skipped:
+- The log-linear part receives ONLY traditional risk factors. It is deliberately constrained — it provides the stable, interpretable backbone.
+- The MLP receives traditional AND telematics inputs, so it can learn interactions BETWEEN them, not just telematics effects in isolation. This is exactly what the paper argues a manually engineered feature set cannot do.
+
+**Warm start**: β is initialised at GLM-A's fitted coefficients, and the MLP's output
+layer is initialised at zero. At epoch 0 the CANN is numerically identical to GLM-A;
+gradient descent can only move away from it in directions that improve the
+likelihood.
+
+## 8.1 Preparation des variables 
+```{r}
+
+# VARIABLES
+trad_numeric <- c("Insured.age", "Car.age", "Credit.score", "Years.noclaims", "Annual.miles.drive")
+trad_factors <- c("Insured.sex", "Marital", "Region", "Car.use.grp")
+
+telematics_selected <- c(
+  "Pct.drive.thr",
+  "Pct.drive.rush.pm",
+  "Accel.06miles",
+  "Brake.06miles",
+  "Left.turn.intensity08",
+  "Right.turn.intensity10"
+)
+
+###################################################
+# ALIGN FACTOR LEVELS
+###################################################
+
+for(v in trad_factors){
+
+  train_dt[[v]] <- factor(train_dt[[v]])
+
+  test_dt[[v]] <- factor(
+    test_dt[[v]],
+    levels = levels(train_dt[[v]])
+  )
+}
+
+###################################################
+# STANDARDIZATION PARAMETERS
+###################################################
+
+std_from_train <- function(x){
+
+  list(
+    mean = mean(x, na.rm = TRUE),
+    sd   = sd(x, na.rm = TRUE)
+  )
+
+}
+
+trad_stats <- lapply(
+  train_dt[, ..trad_numeric],
+  std_from_train
+)
+
+tele_stats <- lapply(
+  train_dt[, ..telematics_selected],
+  std_from_train
+)
+
+###################################################
+# SCALING FUNCTION
+###################################################
+
+scale_block <- function(data, vars, stats){
+
+  m <- sapply(vars, function(v){
+
+    (data[[v]] - stats[[v]]$mean) /
+      stats[[v]]$sd
+
+  })
+
+  m <- as.matrix(m)
+
+  colnames(m) <- vars
+
+  m
+}
+
+###################################################
+# BRANCH 1 : GLM/TRADITIONAL VARIABLES
+###################################################
+
+f_trad <- ~
+
+  Insured.sex +
+  Marital +
+  Region +
+  Car.use.grp +
+
+  Insured.age +
+  Car.age +
+  Years.noclaims +
+  Credit.score
+
+X_trad_train <- model.matrix(
+  f_trad,
+  data = train_dt
+)
+
+X_trad_test <- model.matrix(
+  f_trad,
+  data = test_dt
+)
+
+###################################################
+# BRANCH 2 : TELEMATICS VARIABLES
+###################################################
+
+X_tele_train <- scale_block(
+  train_dt,
+  telematics_selected,
+  tele_stats
+)
+
+X_tele_test <- scale_block(
+  test_dt,
+  telematics_selected,
+  tele_stats
+)
+
+###################################################
+# TARGET
+###################################################
+
+y_train <- train_dt$NB_Claim
+y_test  <- test_dt$NB_Claim
+
+###################################################
+# OFFSET
+###################################################
+
+offset_train <- log(train_dt$Exposure)
+offset_test  <- log(test_dt$Exposure)
+
+###################################################
+# GLM COEFFICIENTS FOR WARM START
+###################################################
+
+beta_glm <- coef(mod_full_nb)
+
+###################################################
+# CHECKS
+###################################################
+
+cat(
+  "X_trad_train:",
+  dim(X_trad_train),
+  "\n"
+)
+
+cat(
+  "X_tele_train:",
+  dim(X_tele_train),
+  "\n"
+)
+
+cat(
+  "Length y_train:",
+  length(y_train),
+  "\n"
+)
+
+cat(
+  "Length beta_glm:",
+  length(beta_glm),
+  "\n"
+)
+
+###################################################
+# VERIFY DESIGN MATRIX VS GLM
+###################################################
+
+names(beta_glm)
+
+colnames(X_trad_train)
+```
+
+
+
+
+```{r cann-design-matrices}
+
+f_glm_full <- formula(mod_full_nb)# on extrait la forumle complte du glm 
+# construction des matrices 
+X_trad_train <- mm(f_glm_full, train_dt)
+X_trad_test <- mm(f_glm_full, test_dt)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+### Modifications to be made 
+
+- age 16 and 17 and beyond 89 fexosure are very low so we will merge into our database 
+{ 16;17} merged into age 18 ; and age {>89 / MERGED into 88}
+- there seems to be higher frequency from female despite the generally lower exposure 
+LOOK AT THE EXPOSURE AND FRQUENCY BY CATRGORICAL VARIABLE RATHER THAN JUST SEX 
+
+- After Insured Age 85 keep the frequency flat 
+
+CROSS VALIDATION IS DONE AFTER YOU ESTIMATED THE MODEL TO CALCULATE THE METRICS AND PREDICTABILITY 
